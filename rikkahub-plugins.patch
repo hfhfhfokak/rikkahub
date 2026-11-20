@@ -1,0 +1,1300 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+index 461f8b4..7d1aaae 100644
+--- a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
++++ b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+@@ -123,6 +123,7 @@ import me.rerere.rikkahub.ui.pages.setting.SettingDonatePage
+ import me.rerere.rikkahub.ui.pages.setting.SettingFilesPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingMcpDetailPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingMcpPage
++import me.rerere.rikkahub.ui.pages.setting.SettingPluginPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingModelPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingProviderDetailPage
+@@ -522,6 +523,10 @@ class RouteActivity : ComponentActivity() {
+                                 SettingMcpPage()
+                             }
+ 
++                            entry<Screen.SettingPlugin> {
++                                SettingPluginPage()
++                            }
++
+                             entry<Screen.SettingMcpDetail> { key ->
+                                 SettingMcpDetailPage(id = Uuid.parse(key.serverId))
+                             }
+@@ -776,6 +781,9 @@ sealed interface Screen : NavKey {
+     @Serializable
+     data object SettingMcp : Screen
+ 
++    @Serializable
++    data object SettingPlugin : Screen
++
+     @Serializable
+     data class SettingMcpDetail(val serverId: String) : Screen
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/ChatRequestFactory.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/ChatRequestFactory.kt
+index 45df3c8..48148fb 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/ChatRequestFactory.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/ChatRequestFactory.kt
+@@ -25,6 +25,9 @@ import me.rerere.ai.ui.limitContext
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.prompts.buildMemoryPrompt
+ import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
++import me.rerere.rikkahub.plugin.PluginInputTransformer
++import me.rerere.rikkahub.plugin.PluginManager
++import me.rerere.rikkahub.plugin.PluginOutputTransformer
+ import me.rerere.rikkahub.data.ai.transformers.Base64ImageToLocalFileTransformer
+ import me.rerere.rikkahub.data.ai.transformers.DocumentAsPromptTransformer
+ import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
+@@ -83,6 +86,7 @@ class ChatRequestFactory(
+     private val memoryRepository: MemoryRepository,
+     templateTransformer: TemplateTransformer,
+     workspaceRepository: WorkspaceRepository,
++    private val pluginManager: PluginManager,
+ ) {
+     private val inputTransformers: List<InputMessageTransformer> = listOf(
+         TimeReminderTransformer,
+@@ -92,12 +96,14 @@ class ChatRequestFactory(
+         OcrTransformer,
+         templateTransformer,
+         WorkspaceReminderTransformer(workspaceRepository),
++        PluginInputTransformer(pluginManager),
+     )
+ 
+     private val outputTransformers: List<OutputMessageTransformer> = listOf(
+         ThinkTagTransformer,
+         Base64ImageToLocalFileTransformer,
+         RegexOutputTransformer,
++        PluginOutputTransformer(pluginManager),
+     )
+ 
+     /** 解析本轮的助手、模型、记忆和工具；MCP 服务名不合法时抛出 InvalidMcpServerNamesException */
+@@ -252,6 +258,11 @@ class ChatRequestFactory(
+                     appendLine()
+                     append(tool.systemPrompt(turn.model, messages))
+                 }
++                // 插件（Plugins）提供的系统提示词
++                pluginManager.getSystemPrompt().takeIf { it.isNotBlank() }?.let {
++                    appendLine()
++                    append(it)
++                }
+             }
+             if (system.isNotBlank()) {
+                 add(UIMessage.system(prompt = system).copy(isSynthetic = true))
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
+index fee6c19..fb55fb3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
+@@ -17,6 +17,7 @@ import me.rerere.rikkahub.data.repository.MemoryRepository
+ import me.rerere.rikkahub.data.repository.WorkspaceRepository
+ import me.rerere.rikkahub.data.repository.memoryId
+ import me.rerere.rikkahub.data.skills.SkillManager
++import me.rerere.rikkahub.plugin.PluginManager
+ import me.rerere.rikkahub.service.BackgroundShellManager
+ import me.rerere.workspace.WorkspaceShellStatus
+ import java.io.File
+@@ -46,6 +47,7 @@ class ChatToolFactory(
+     private val skillManager: SkillManager,
+     private val workspaceRepository: WorkspaceRepository,
+     private val backgroundShellManager: BackgroundShellManager,
++    private val pluginManager: PluginManager,
+ ) {
+     suspend fun createTools(
+         settings: Settings,
+@@ -68,6 +70,7 @@ class ChatToolFactory(
+                 addAll(createConversationTools(conversationRepository, assistant.id))
+             }
+             addAll(workspaceTools)
++            addAll(pluginManager.getTools())
+             if (assistant.enabledSkills.isNotEmpty()) {
+                 addAll(
+                     createSkillTools(
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt b/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
+index 34394f8..0301a9f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
+@@ -7,6 +7,7 @@ import kotlinx.serialization.json.Json
+ import me.rerere.rikkahub.AppScope
+ import me.rerere.rikkahub.data.ai.ChatRequestFactory
+ import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
++import me.rerere.rikkahub.plugin.PluginManager
+ import me.rerere.rikkahub.data.ai.tools.local.LocalTools
+ import me.rerere.rikkahub.data.event.AppEventBus
+ import me.rerere.rikkahub.phoneuse.PhoneUseManager
+@@ -117,9 +118,14 @@ val appModule = module {
+             skillManager = get(),
+             workspaceRepository = get(),
+             backgroundShellManager = get(),
++            pluginManager = get(),
+         )
+     }
+ 
++    single(createdAtStart = true) {
++        PluginManager(context = get(), appScope = get())
++    }
++
+     single {
+         BackgroundShellManager(
+             context = get(),
+@@ -136,6 +142,7 @@ val appModule = module {
+             memoryRepository = get(),
+             templateTransformer = get(),
+             workspaceRepository = get(),
++            pluginManager = get(),
+         )
+     }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/PluginManager.kt b/app/src/main/java/me/rerere/rikkahub/plugin/PluginManager.kt
+new file mode 100644
+index 0000000..3b202ea
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/PluginManager.kt
+@@ -0,0 +1,416 @@
++package me.rerere.rikkahub.plugin
++
++import android.app.Application
++import android.content.Context
++import android.content.SharedPreferences
++import android.net.Uri
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import dalvik.system.DexClassLoader
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.Serializable
++import kotlinx.serialization.encodeToString
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.jsonArray
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import me.rerere.ai.core.InputSchema
++import me.rerere.ai.core.Tool
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.AppScope
++import me.rerere.rikkahub.BuildConfig
++import me.rerere.rikkahub.plugin.api.PluginContext
++import me.rerere.rikkahub.plugin.api.PluginTool
++import me.rerere.rikkahub.plugin.api.RikkaPlugin
++import org.koin.core.context.GlobalContext
++import java.io.File
++import java.util.UUID
++import java.util.concurrent.ConcurrentHashMap
++import java.util.zip.ZipEntry
++import java.util.zip.ZipFile
++import java.util.zip.ZipOutputStream
++
++private const val TAG = "PluginManager"
++private const val MAX_PLUGIN_BYTES = 256L * 1024 * 1024
++private val PLUGIN_ID_REGEX = Regex("^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
++private val DEX_NAME_REGEX = Regex("^classes\\d*\\.dex$")
++
++/** Содержимое plugin.json в корне zip-архива плагина. */
++@Serializable
++data class PluginManifest(
++    val id: String,
++    val name: String,
++    val version: String = "1.0",
++    val description: String = "",
++    val author: String = "",
++    /** Полное имя класса, унаследованного от [RikkaPlugin]. */
++    val mainClass: String,
++    /** Минимальный versionCode приложения. */
++    val minAppVersionCode: Int = 0,
++)
++
++data class PluginInfo(
++    val manifest: PluginManifest,
++    val enabled: Boolean,
++    val loaded: Boolean,
++    val error: String? = null,
++)
++
++@Serializable
++private data class PluginState(val enabled: List<String> = emptyList())
++
++private class LoadedPlugin(
++    val manifest: PluginManifest,
++    val plugin: RikkaPlugin,
++)
++
++/**
++ * Управляет плагинами: установка из .zip, включение/выключение, удаление и загрузка кода (DexClassLoader).
++ *
++ * Формат zip: plugin.json + classes.dex (можно classes2.dex ...) + любые ресурсы
++ * (+ lib/<abi>/*.so для нативных библиотек).
++ *
++ * ВНИМАНИЕ: плагин выполняется в процессе приложения с теми же правами и без песочницы.
++ */
++class PluginManager(
++    private val context: Context,
++    private val appScope: AppScope,
++) {
++    private val json = Json { ignoreUnknownKeys = true; prettyPrint = true }
++    private val root = File(context.filesDir, "plugins").apply { mkdirs() }
++    private val stateFile = File(root, "state.json")
++    private val loadingMarker = File(root, ".loading")
++    private val lock = Mutex()
++    private val loaded = ConcurrentHashMap<String, LoadedPlugin>()
++    private val errors = ConcurrentHashMap<String, String>()
++    private val ready = CompletableDeferred<Unit>()
++
++    private val _plugins = MutableStateFlow<List<PluginInfo>>(emptyList())
++    val plugins: StateFlow<List<PluginInfo>> = _plugins.asStateFlow()
++
++    init {
++        appScope.launch(Dispatchers.IO) {
++            try {
++                lock.withLock {
++                    recoverFromCrash()
++                    readState().forEach { id -> loadPluginSafely(id) }
++                    publish()
++                }
++            } catch (e: Throwable) {
++                Log.e(TAG, "init failed", e)
++            } finally {
++                ready.complete(Unit)
++            }
++        }
++    }
++
++    // ---------- публичный API ----------
++
++    suspend fun awaitReady() = ready.await()
++
++    /** Установить (или обновить) плагин из zip. Новый плагин устанавливается выключенным. */
++    suspend fun install(uri: Uri): Result<PluginInfo> = withContext(Dispatchers.IO) {
++        lock.withLock {
++            runCatching {
++                val tmp = File(root, ".tmp-${UUID.randomUUID()}")
++                try {
++                    val manifest = extractToTemp(uri, tmp)
++                    val target = File(root, manifest.id)
++                    val wasEnabled = manifest.id in readState()
++                    unloadPlugin(manifest.id)
++                    target.deleteRecursively()
++                    check(tmp.renameTo(target)) { "Cannot move plugin to ${target.path}" }
++                    File(target, "code.jar").setReadOnly()
++                    errors.remove(manifest.id)
++                    if (wasEnabled) loadPluginSafely(manifest.id)
++                    publish()
++                    _plugins.value.first { it.manifest.id == manifest.id }
++                } finally {
++                    tmp.deleteRecursively()
++                }
++            }
++        }
++    }
++
++    suspend fun setEnabled(id: String, enabled: Boolean) = withContext(Dispatchers.IO) {
++        lock.withLock {
++            val state = readState().toMutableSet()
++            if (enabled) {
++                state.add(id)
++                writeState(state)
++                loadPluginSafely(id)
++                // не удалось загрузить — оставляем выключенным, ошибка видна в списке
++                if (!loaded.containsKey(id)) {
++                    state.remove(id)
++                    writeState(state)
++                }
++            } else {
++                state.remove(id)
++                writeState(state)
++                unloadPlugin(id)
++                errors.remove(id)
++            }
++            publish()
++        }
++    }
++
++    suspend fun uninstall(id: String) = withContext(Dispatchers.IO) {
++        lock.withLock {
++            unloadPlugin(id)
++            errors.remove(id)
++            writeState(readState() - id)
++            File(root, id).deleteRecursively()
++            publish()
++        }
++    }
++
++    /** Инструменты всех включённых плагинов. */
++    suspend fun getTools(): List<Tool> {
++        awaitReady()
++        return loaded.values.flatMap { lp ->
++            val tools = runCatching { lp.plugin.tools.orEmpty() }
++                .onFailure { Log.e(TAG, "getTools failed: ${lp.manifest.id}", it) }
++                .getOrDefault(emptyList())
++            tools.mapNotNull { runCatching { toTool(lp.manifest.id, it) }.getOrNull() }
++        }
++    }
++
++    /** Сумма системных промптов всех включённых плагинов. */
++    fun getSystemPrompt(): String = loaded.values.mapNotNull { lp ->
++        runCatching { lp.plugin.systemPrompt }
++            .onFailure { Log.e(TAG, "getSystemPrompt failed: ${lp.manifest.id}", it) }
++            .getOrNull()?.takeIf { it.isNotBlank() }
++    }.joinToString("\n\n")
++
++    fun hasActivePlugins(): Boolean = loaded.isNotEmpty()
++
++    fun transformInput(role: String, text: String): String =
++        loaded.values.fold(text) { acc, lp ->
++            runCatching { lp.plugin.transformInput(role, acc) }
++                .onFailure { Log.e(TAG, "transformInput failed: ${lp.manifest.id}", it) }
++                .getOrNull() ?: acc
++        }
++
++    fun transformOutput(text: String): String =
++        loaded.values.fold(text) { acc, lp ->
++            runCatching { lp.plugin.transformOutput(acc) }
++                .onFailure { Log.e(TAG, "transformOutput failed: ${lp.manifest.id}", it) }
++                .getOrNull() ?: acc
++        }
++
++    // ---------- внутренности ----------
++
++    private fun toTool(pluginId: String, t: PluginTool): Tool {
++        val toolName = "plugin_${pluginId}_${t.name}".replace(Regex("[^A-Za-z0-9_-]"), "_").take(64)
++        val handler = t.handler
++        return Tool(
++            name = toolName,
++            description = t.description.orEmpty(),
++            parameters = {
++                val schema = t.parametersSchema?.takeIf { it.isNotBlank() }
++                    ?.let { runCatching { json.parseToJsonElement(it).jsonObject }.getOrNull() }
++                InputSchema.Obj(
++                    properties = schema?.get("properties")?.jsonObject ?: JsonObject(emptyMap()),
++                    required = schema?.get("required")?.jsonArray?.map { it.jsonPrimitive.content },
++                )
++            },
++            needsApproval = { t.needsApproval },
++            execute = { args ->
++                val result = withContext(Dispatchers.IO) {
++                    try {
++                        handler.execute(args.toString()) ?: ""
++                    } catch (e: Throwable) {
++                        Log.e(TAG, "tool $toolName failed", e)
++                        "Error: ${e.message ?: e.javaClass.simpleName}"
++                    }
++                }
++                listOf(UIMessagePart.Text(result))
++            },
++        )
++    }
++
++    private fun publish() {
++        val enabled = readState().toSet()
++        val infos = root.listFiles()
++            .orEmpty()
++            .filter { it.isDirectory && !it.name.startsWith(".") }
++            .mapNotNull { dir ->
++                val manifest = readManifest(dir) ?: return@mapNotNull null
++                PluginInfo(
++                    manifest = manifest,
++                    enabled = manifest.id in enabled,
++                    loaded = loaded.containsKey(manifest.id),
++                    error = errors[manifest.id],
++                )
++            }
++            .sortedBy { it.manifest.name.lowercase() }
++        _plugins.value = infos
++    }
++
++    private fun readManifest(dir: File): PluginManifest? = runCatching {
++        json.decodeFromString<PluginManifest>(File(dir, "plugin.json").readText())
++    }.getOrNull()
++
++    private fun readState(): List<String> = runCatching {
++        json.decodeFromString<PluginState>(stateFile.readText()).enabled
++    }.getOrDefault(emptyList())
++
++    private fun writeState(enabled: Collection<String>) {
++        stateFile.writeText(json.encodeToString(PluginState(enabled.toList())))
++    }
++
++    /** Если приложение упало во время загрузки плагина — отключаем этот плагин. */
++    private fun recoverFromCrash() {
++        if (!loadingMarker.exists()) return
++        val culprit = runCatching { loadingMarker.readText().trim() }.getOrNull()
++        loadingMarker.delete()
++        if (!culprit.isNullOrEmpty()) {
++            Log.w(TAG, "App crashed while loading plugin $culprit, disabling it")
++            writeState(readState() - culprit)
++            errors[culprit] = "The app crashed while loading this plugin, so it was disabled"
++        }
++    }
++
++    private fun loadPluginSafely(id: String) {
++        if (loaded.containsKey(id)) return
++        val dir = File(root, id)
++        try {
++            loadingMarker.writeText(id)
++            val manifest = readManifest(dir) ?: error("plugin.json is missing or invalid")
++            check(manifest.id == id) { "Plugin id mismatch" }
++            val jar = File(dir, "code.jar")
++            check(jar.exists()) { "code.jar is missing" }
++            // Android 14+: загружаемый код должен быть read-only
++            jar.setReadOnly()
++            val libDir = File(dir, "lib").takeIf { it.isDirectory }?.absolutePath
++            val loader = DexClassLoader(jar.absolutePath, null, libDir, context.classLoader)
++            val plugin = loader.loadClass(manifest.mainClass)
++                .getDeclaredConstructor().newInstance() as RikkaPlugin
++            plugin.onLoad(PluginContextImpl(context.applicationContext as Application, manifest, dir))
++            loaded[id] = LoadedPlugin(manifest, plugin)
++            errors.remove(id)
++        } catch (e: Throwable) {
++            Log.e(TAG, "Failed to load plugin $id", e)
++            errors[id] = (e.cause ?: e).let { "${it.javaClass.simpleName}: ${it.message}" }
++        } finally {
++            loadingMarker.delete()
++        }
++    }
++
++    private fun unloadPlugin(id: String) {
++        val lp = loaded.remove(id) ?: return
++        runCatching { lp.plugin.onUnload() }
++            .onFailure { Log.e(TAG, "onUnload failed: $id", it) }
++    }
++
++    /** Распаковывает zip в [tmp], собирает code.jar из classes*.dex, возвращает манифест. */
++    private fun extractToTemp(uri: Uri, tmp: File): PluginManifest {
++        tmp.mkdirs()
++        val srcZip = File(tmp, "src.zip")
++        context.contentResolver.openInputStream(uri)?.use { input ->
++            srcZip.outputStream().use { out -> input.copyTo(out) }
++        } ?: error("Cannot open file")
++
++        var total = 0L
++        val manifest: PluginManifest
++        ZipFile(srcZip).use { zip ->
++            val entries = zip.entries().asSequence().filter { !it.isDirectory }.toList()
++            val manifestEntry = entries.firstOrNull { it.name == "plugin.json" }
++                ?: entries.filter { it.name.endsWith("/plugin.json") }.minByOrNull { it.name.length }
++                ?: error("plugin.json not found in the archive")
++            val prefix = manifestEntry.name.removeSuffix("plugin.json")
++            manifest = json.decodeFromString<PluginManifest>(
++                zip.getInputStream(manifestEntry).use { it.readBytes().decodeToString() }
++            )
++            require(PLUGIN_ID_REGEX.matches(manifest.id)) { "Invalid plugin id: ${manifest.id}" }
++            require(manifest.mainClass.isNotBlank()) { "mainClass is empty" }
++            require(manifest.minAppVersionCode <= (BuildConfig.VERSION_CODE.toIntOrNull() ?: 0)) {
++                "Plugin requires a newer app version (${manifest.minAppVersionCode})"
++            }
++
++            val abi = Build.SUPPORTED_ABIS.firstOrNull { a ->
++                entries.any { it.name.startsWith("${prefix}lib/$a/") }
++            }
++            var dexCount = 0
++            ZipOutputStream(File(tmp, "code.jar").outputStream().buffered()).use { jarOut ->
++                for (entry in entries) {
++                    if (!entry.name.startsWith(prefix)) continue
++                    val rel = entry.name.removePrefix(prefix).replace('\\', '/')
++                    if (rel == "plugin.json") continue
++                    total += entry.size.coerceAtLeast(0)
++                    require(total <= MAX_PLUGIN_BYTES) { "Plugin is too large" }
++                    when {
++                        DEX_NAME_REGEX.matches(rel) -> {
++                            jarOut.putNextEntry(ZipEntry(rel))
++                            zip.getInputStream(entry).use { it.copyTo(jarOut) }
++                            jarOut.closeEntry()
++                            dexCount++
++                        }
++                        rel.startsWith("lib/") -> {
++                            if (abi != null && rel.startsWith("lib/$abi/")) {
++                                copyEntry(zip, entry, File(tmp, "lib"), rel.removePrefix("lib/$abi/"))
++                            }
++                        }
++                        else -> copyEntry(zip, entry, tmp, "files/$rel")
++                    }
++                }
++            }
++            require(dexCount > 0) { "No classes.dex found in the archive" }
++        }
++        srcZip.delete()
++        File(tmp, "plugin.json").writeText(json.encodeToString(manifest))
++        // Папка плагина доступна ему для записи данных
++        File(tmp, "data").mkdirs()
++        return manifest
++    }
++
++    private fun copyEntry(zip: ZipFile, entry: ZipEntry, baseDir: File, relPath: String) {
++        val out = File(baseDir, relPath).canonicalFile
++        // защита от zip-slip
++        require(out.path.startsWith(baseDir.canonicalPath + File.separator)) { "Bad entry path: $relPath" }
++        out.parentFile?.mkdirs()
++        zip.getInputStream(entry).use { input -> out.outputStream().use { input.copyTo(it) } }
++    }
++}
++
++private class PluginContextImpl(
++    private val app: Application,
++    private val manifest: PluginManifest,
++    private val dir: File,
++) : PluginContext {
++    private val mainHandler = Handler(Looper.getMainLooper())
++
++    override fun getApplication(): Application = app
++
++    override fun getPluginId(): String = manifest.id
++
++    override fun getPluginDir(): File = dir
++
++    override fun getPreferences(): SharedPreferences =
++        app.getSharedPreferences("plugin_${manifest.id}", Context.MODE_PRIVATE)
++
++    override fun getHostVersionCode(): Int = BuildConfig.VERSION_CODE.toIntOrNull() ?: 0
++
++    override fun getHostService(className: String): Any? = runCatching {
++        GlobalContext.get().getOrNull<Any>(Class.forName(className).kotlin)
++    }.getOrNull()
++
++    override fun runOnMainThread(runnable: Runnable) {
++        if (Looper.myLooper() == Looper.getMainLooper()) runnable.run() else mainHandler.post(runnable)
++    }
++
++    override fun log(message: String) {
++        Log.i("Plugin/${manifest.id}", message)
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/PluginTransformers.kt b/app/src/main/java/me/rerere/rikkahub/plugin/PluginTransformers.kt
+new file mode 100644
+index 0000000..2ac4912
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/PluginTransformers.kt
+@@ -0,0 +1,40 @@
++package me.rerere.rikkahub.plugin
++
++import me.rerere.ai.core.MessageRole
++import me.rerere.ai.ui.UIMessage
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.ai.transformers.InputMessageTransformer
++import me.rerere.rikkahub.data.ai.transformers.OutputMessageTransformer
++import me.rerere.rikkahub.data.ai.transformers.TransformerContext
++
++private fun UIMessage.mapText(block: (String) -> String): UIMessage = copy(
++    parts = parts.map { part ->
++        if (part is UIMessagePart.Text) {
++            val newText = block(part.text)
++            if (newText == part.text) part else part.copy(text = newText)
++        } else {
++            part
++        }
++    }
++)
++
++/** Прогоняет текст запроса через плагины перед отправкой модели. */
++class PluginInputTransformer(private val manager: PluginManager) : InputMessageTransformer {
++    override suspend fun transform(ctx: TransformerContext, messages: List<UIMessage>): List<UIMessage> {
++        if (!manager.hasActivePlugins()) return messages
++        return messages.map { msg ->
++            val role = msg.role.name.lowercase()
++            msg.mapText { manager.transformInput(role, it) }
++        }
++    }
++}
++
++/** Прогоняет готовый ответ модели через плагины. */
++class PluginOutputTransformer(private val manager: PluginManager) : OutputMessageTransformer {
++    override suspend fun transform(ctx: TransformerContext, messages: List<UIMessage>): List<UIMessage> {
++        if (!manager.hasActivePlugins()) return messages
++        return messages.map { msg ->
++            if (msg.role == MessageRole.ASSISTANT) msg.mapText { manager.transformOutput(it) } else msg
++        }
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginContext.java b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginContext.java
+new file mode 100644
+index 0000000..93ecf0a
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginContext.java
+@@ -0,0 +1,41 @@
++package me.rerere.rikkahub.plugin.api;
++
++import android.app.Application;
++import android.content.SharedPreferences;
++
++import java.io.File;
++
++/** Доступ плагина к приложению. Создаётся приложением и передаётся в {@link RikkaPlugin#onLoad}. */
++public interface PluginContext {
++
++    /** Application приложения: через него доступны Context, ActivityLifecycleCallbacks, ресурсы и т.д. */
++    Application getApplication();
++
++    /** Идентификатор плагина из plugin.json. */
++    String getPluginId();
++
++    /**
++     * Папка плагина. Ресурсы из zip (кроме plugin.json и classes*.dex) лежат в подпапке "files",
++     * подпапка "data" — для записи ваших данных. Папка очищается при обновлении плагина (кроме SharedPreferences).
++     */
++    File getPluginDir();
++
++    /** Постоянные настройки плагина. */
++    SharedPreferences getPreferences();
++
++    /** versionCode приложения RikkaHub. */
++    int getHostVersionCode();
++
++    /**
++     * Получить внутренний сервис приложения из Koin по имени класса, например
++     * "me.rerere.rikkahub.data.datastore.SettingsStore". Возвращает null, если не найден.
++     * Классы приложения доступны плагину напрямую через рефлексию/ClassLoader.
++     */
++    Object getHostService(String className);
++
++    /** Выполнить код в главном потоке. */
++    void runOnMainThread(Runnable runnable);
++
++    /** Запись в logcat с тегом плагина. */
++    void log(String message);
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginTool.java b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginTool.java
+new file mode 100644
+index 0000000..43dabc3
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginTool.java
+@@ -0,0 +1,38 @@
++package me.rerere.rikkahub.plugin.api;
++
++/** Описание инструмента, который плагин предоставляет модели. */
++public final class PluginTool {
++    private final String name;
++    private final String description;
++    private final String parametersSchema;
++    private final boolean needsApproval;
++    private final PluginToolHandler handler;
++
++    /**
++     * @param name             имя инструмента: латиница, цифры, _ и -
++     * @param description      описание для модели
++     * @param parametersSchema JSON-схема параметров, например
++     *                         {"properties":{"city":{"type":"string"}},"required":["city"]}.
++     *                         null или пустая строка — без параметров.
++     * @param handler          обработчик вызова (выполняется в фоновом потоке)
++     */
++    public PluginTool(String name, String description, String parametersSchema, PluginToolHandler handler) {
++        this(name, description, parametersSchema, false, handler);
++    }
++
++    /** То же, но с флагом: требовать подтверждение пользователя перед вызовом. */
++    public PluginTool(String name, String description, String parametersSchema,
++                      boolean needsApproval, PluginToolHandler handler) {
++        this.name = name;
++        this.description = description;
++        this.parametersSchema = parametersSchema;
++        this.needsApproval = needsApproval;
++        this.handler = handler;
++    }
++
++    public String getName() { return name; }
++    public String getDescription() { return description; }
++    public String getParametersSchema() { return parametersSchema; }
++    public boolean getNeedsApproval() { return needsApproval; }
++    public PluginToolHandler getHandler() { return handler; }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginToolHandler.java b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginToolHandler.java
+new file mode 100644
+index 0000000..8cded53
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/api/PluginToolHandler.java
+@@ -0,0 +1,10 @@
++package me.rerere.rikkahub.plugin.api;
++
++/** Обработчик вызова инструмента. */
++public interface PluginToolHandler {
++    /**
++     * @param argumentsJson аргументы вызова в виде JSON-строки (объект)
++     * @return текстовый результат, который увидит модель
++     */
++    String execute(String argumentsJson) throws Exception;
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/plugin/api/RikkaPlugin.java b/app/src/main/java/me/rerere/rikkahub/plugin/api/RikkaPlugin.java
+new file mode 100644
+index 0000000..623e43c
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/plugin/api/RikkaPlugin.java
+@@ -0,0 +1,50 @@
++package me.rerere.rikkahub.plugin.api;
++
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Базовый класс плагина RikkaHub. Плагин (Java или Kotlin) наследует его и указывает
++ * полное имя своего класса в поле {@code mainClass} файла plugin.json.
++ *
++ * Класс должен иметь публичный конструктор без аргументов.
++ * Все методы необязательны для переопределения.
++ *
++ * Плагин выполняется в процессе приложения без песочницы: через {@link PluginContext}
++ * ему доступны Application, внутренние сервисы приложения (Koin), SharedPreferences и т.д.
++ */
++public abstract class RikkaPlugin {
++
++    /** Вызывается при включении плагина (и при запуске приложения, если плагин включён). */
++    public void onLoad(PluginContext context) throws Exception {
++    }
++
++    /** Вызывается при выключении или удалении плагина. Освободите ресурсы, остановите потоки. */
++    public void onUnload() {
++    }
++
++    /** Инструменты (tools), которые будут доступны модели во всех чатах. Вызывается при каждой генерации. */
++    public List<PluginTool> getTools() {
++        return Collections.emptyList();
++    }
++
++    /** Текст, который дописывается в конец системного промпта. null — ничего не добавлять. */
++    public String getSystemPrompt() {
++        return null;
++    }
++
++    /**
++     * Преобразование текста сообщения перед отправкой модели (меняет только запрос, не историю чата).
++     *
++     * @param role "system", "user", "assistant" или "tool"
++     * @return новый текст
++     */
++    public String transformInput(String role, String text) {
++        return text;
++    }
++
++    /** Преобразование готового текстового ответа модели (результат сохраняется в чате). */
++    public String transformOutput(String text) {
++        return text;
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+index 2552dca..6e09643 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+@@ -59,6 +59,7 @@ import me.rerere.hugeicons.stroke.ImageUpload
+ import me.rerere.hugeicons.stroke.InLove
+ import me.rerere.hugeicons.stroke.LookTop
+ import me.rerere.hugeicons.stroke.McpServer
++import me.rerere.hugeicons.stroke.Puzzle
+ import me.rerere.hugeicons.stroke.Megaphone01
+ import me.rerere.hugeicons.stroke.Moon02
+ import me.rerere.hugeicons.stroke.Package
+@@ -416,6 +417,21 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+                     )
+                 }
+             }
++
++            item("pluginSettings") {
++                val containerColor = MaterialTheme.colorScheme.tertiaryContainer
++                val contentColor = MaterialTheme.colorScheme.onTertiaryContainer
++                CardGroup(
++                    title = { Text(stringResource(R.string.setting_page_plugins)) },
++                ) {
++                    item(
++                        onClick = { navController.navigate(Screen.SettingPlugin) },
++                        leadingContent = { CardGroupIcon(HugeIcons.Puzzle, containerColor = containerColor, contentColor = contentColor) },
++                        supportingContent = { Text(stringResource(R.string.setting_page_plugins_desc)) },
++                        headlineContent = { Text(stringResource(R.string.setting_page_plugins_add)) },
++                    )
++                }
++            }
+         }
+     }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPluginPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPluginPage.kt
+new file mode 100644
+index 0000000..0d5d9d1
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPluginPage.kt
+@@ -0,0 +1,241 @@
++package me.rerere.rikkahub.ui.pages.setting
++
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.calculateEndPadding
++import androidx.compose.foundation.layout.calculateStartPadding
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.FloatingActionButton
++import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
++import androidx.compose.material3.LargeFlexibleTopAppBar
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Switch
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import kotlinx.coroutines.launch
++import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Add01
++import me.rerere.hugeicons.stroke.Delete01
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.plugin.PluginInfo
++import me.rerere.rikkahub.plugin.PluginManager
++import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.context.LocalToaster
++import me.rerere.rikkahub.ui.theme.CustomColors
++import org.koin.compose.koinInject
++
++@Composable
++fun SettingPluginPage() {
++    val manager = koinInject<PluginManager>()
++    val plugins by manager.plugins.collectAsStateWithLifecycle()
++    val scope = rememberCoroutineScope()
++    val context = LocalContext.current
++    val toaster = LocalToaster.current
++    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
++    val layoutDirection = LocalLayoutDirection.current
++
++    var pendingEnable by remember { mutableStateOf<PluginInfo?>(null) }
++    var pendingDelete by remember { mutableStateOf<PluginInfo?>(null) }
++
++    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        uri ?: return@rememberLauncherForActivityResult
++        scope.launch {
++            manager.install(uri)
++                .onSuccess {
++                    toaster.show(context.getString(R.string.plugin_page_install_success, it.manifest.name))
++                }
++                .onFailure {
++                    toaster.show(
++                        context.getString(R.string.plugin_page_install_failed, it.message ?: it.javaClass.simpleName)
++                    )
++                }
++        }
++    }
++
++    Scaffold(
++        topBar = {
++            LargeFlexibleTopAppBar(
++                title = { Text(stringResource(R.string.setting_page_plugins)) },
++                navigationIcon = { BackButton() },
++                scrollBehavior = scrollBehavior,
++                colors = CustomColors.topBarColors,
++            )
++        },
++        floatingActionButton = {
++            FloatingActionButton(
++                onClick = {
++                    filePicker.launch(
++                        arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")
++                    )
++                }
++            ) {
++                Icon(HugeIcons.Add01, contentDescription = stringResource(R.string.plugin_page_add))
++            }
++        },
++        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
++        containerColor = CustomColors.topBarColors.containerColor,
++    ) { innerPadding ->
++        Box(modifier = Modifier.fillMaxSize()) {
++            LazyColumn(
++                modifier = Modifier.fillMaxSize(),
++                verticalArrangement = Arrangement.spacedBy(8.dp),
++                contentPadding = PaddingValues(
++                    start = innerPadding.calculateStartPadding(layoutDirection) + 16.dp,
++                    top = innerPadding.calculateTopPadding() + 16.dp,
++                    end = innerPadding.calculateEndPadding(layoutDirection) + 16.dp,
++                    // место под FAB
++                    bottom = innerPadding.calculateBottomPadding() + 96.dp,
++                ),
++            ) {
++                items(plugins, key = { it.manifest.id }) { info ->
++                    PluginItem(
++                        info = info,
++                        onToggle = { enabled ->
++                            if (enabled) {
++                                pendingEnable = info
++                            } else {
++                                scope.launch { manager.setEnabled(info.manifest.id, false) }
++                            }
++                        },
++                        onDelete = { pendingDelete = info },
++                        modifier = Modifier.animateItem(),
++                    )
++                }
++            }
++
++            if (plugins.isEmpty()) {
++                Column(
++                    modifier = Modifier
++                        .align(Alignment.Center)
++                        .padding(32.dp),
++                    verticalArrangement = Arrangement.spacedBy(8.dp),
++                    horizontalAlignment = Alignment.CenterHorizontally,
++                ) {
++                    Text(text = stringResource(R.string.plugin_page_empty))
++                    Text(
++                        text = stringResource(R.string.plugin_page_empty_hint),
++                        style = MaterialTheme.typography.bodySmall,
++                    )
++                }
++            }
++        }
++    }
++
++    pendingEnable?.let { info ->
++        AlertDialog(
++            onDismissRequest = { pendingEnable = null },
++            title = { Text(stringResource(R.string.plugin_page_enable_title, info.manifest.name)) },
++            text = { Text(stringResource(R.string.plugin_page_enable_warning)) },
++            confirmButton = {
++                TextButton(
++                    onClick = {
++                        pendingEnable = null
++                        scope.launch { manager.setEnabled(info.manifest.id, true) }
++                    }
++                ) { Text(stringResource(R.string.plugin_page_enable)) }
++            },
++            dismissButton = {
++                TextButton(onClick = { pendingEnable = null }) { Text(stringResource(R.string.cancel)) }
++            },
++        )
++    }
++
++    pendingDelete?.let { info ->
++        AlertDialog(
++            onDismissRequest = { pendingDelete = null },
++            title = { Text(stringResource(R.string.plugin_page_delete_title, info.manifest.name)) },
++            text = { Text(stringResource(R.string.plugin_page_delete_text)) },
++            confirmButton = {
++                TextButton(
++                    onClick = {
++                        pendingDelete = null
++                        scope.launch { manager.uninstall(info.manifest.id) }
++                    }
++                ) { Text(stringResource(R.string.delete)) }
++            },
++            dismissButton = {
++                TextButton(onClick = { pendingDelete = null }) { Text(stringResource(R.string.cancel)) }
++            },
++        )
++    }
++}
++
++@Composable
++private fun PluginItem(
++    info: PluginInfo,
++    onToggle: (Boolean) -> Unit,
++    onDelete: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val manifest = info.manifest
++    Card(
++        modifier = modifier.fillMaxWidth(),
++        colors = CardDefaults.cardColors(containerColor = CustomColors.listItemColors.containerColor),
++    ) {
++        Column(
++            modifier = Modifier.padding(16.dp),
++            verticalArrangement = Arrangement.spacedBy(4.dp),
++        ) {
++            Row(
++                verticalAlignment = Alignment.CenterVertically,
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++            ) {
++                Column(modifier = Modifier.weight(1f)) {
++                    Text(text = manifest.name, style = MaterialTheme.typography.titleMedium)
++                    val meta = buildString {
++                        append("v").append(manifest.version)
++                        if (manifest.author.isNotBlank()) append(" · ").append(manifest.author)
++                    }
++                    Text(
++                        text = meta,
++                        style = MaterialTheme.typography.labelMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    )
++                }
++                Switch(checked = info.enabled, onCheckedChange = onToggle)
++                IconButton(onClick = onDelete) {
++                    Icon(HugeIcons.Delete01, contentDescription = stringResource(R.string.delete))
++                }
++            }
++            if (manifest.description.isNotBlank()) {
++                Text(text = manifest.description, style = MaterialTheme.typography.bodyMedium)
++            }
++            info.error?.let {
++                Text(
++                    text = stringResource(R.string.plugin_page_error, it),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.error,
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/keepRules/rikkahub.keep b/app/src/main/keepRules/rikkahub.keep
+index c78e645..811c6a7 100644
+--- a/app/src/main/keepRules/rikkahub.keep
++++ b/app/src/main/keepRules/rikkahub.keep
+@@ -44,3 +44,7 @@
+ -dontwarn org.slf4j.**
+ -dontwarn org.apache.logging.log4j.**
+ -dontwarn org.ietf.jgss.**
++
++# Plugin API is implemented by external dex plugins loaded at runtime; keep it intact.
++-keep class me.rerere.rikkahub.plugin.api.** { *; }
++-keep class me.rerere.rikkahub.plugin.PluginManifest { *; }
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 53bc8ab..2b928e7 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -1933,4 +1933,18 @@
+   <string name="quick_start_page_deepseek_import_desc">Выберите ZIP-файл из предыдущего шага. Для каждого чата в текущего ассистента \"%1$s\" импортируется отображаемая сейчас ветка, включая рассуждения и вложения. Уже импортированные чаты пропускаются, поэтому повторный импорт безопасен.</string>
+   <string name="quick_start_page_deepseek_importing">Импорт…</string>
+   <string name="quick_start_page_deepseek_import_another">Импортировать другой ZIP</string>
++  <string name="setting_page_plugins">Плагины</string>
++  <string name="setting_page_plugins_desc">Установка и управление плагинами (.zip), расширяющими приложение</string>
++  <string name="setting_page_plugins_add">Добавить плагины</string>
++  <string name="plugin_page_add">Добавить плагин</string>
++  <string name="plugin_page_empty">Плагины не установлены</string>
++  <string name="plugin_page_empty_hint">Нажмите «+» и выберите .zip-файл плагина</string>
++  <string name="plugin_page_install_success">Плагин «%1$s» установлен. Включите его, чтобы начать использовать</string>
++  <string name="plugin_page_install_failed">Не удалось установить: %1$s</string>
++  <string name="plugin_page_enable_title">Включить «%1$s»?</string>
++  <string name="plugin_page_enable_warning">Плагин работает внутри приложения с полным доступом к его данным, включая чаты и API-ключи, без песочницы. Включайте только плагины из надёжных источников.</string>
++  <string name="plugin_page_enable">Включить</string>
++  <string name="plugin_page_delete_title">Удалить «%1$s»?</string>
++  <string name="plugin_page_delete_text">Плагин и его файлы будут удалены.</string>
++  <string name="plugin_page_error">Ошибка: %1$s</string>
+ </resources>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index e0fc061..5ceeb5b 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1933,4 +1933,18 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过
+   <string name="quick_start_card_desc">RikkaHub 需要接入模型服务商才能聊天。跟着快速入门配置提供商和默认模型，也可以从 DeepSeek 迁移聊天记录。</string>
+   <string name="setting_page_quick_start">快速入门</string>
+   <string name="setting_page_quick_start_desc">一步步配置提供商和模型，或从 DeepSeek 迁移</string>
++  <string name="setting_page_plugins">插件</string>
++  <string name="setting_page_plugins_desc">安装和管理扩展应用功能的插件（.zip）</string>
++  <string name="setting_page_plugins_add">添加插件</string>
++  <string name="plugin_page_add">添加插件</string>
++  <string name="plugin_page_empty">尚未安装插件</string>
++  <string name="plugin_page_empty_hint">点击“+”并选择插件 .zip 文件</string>
++  <string name="plugin_page_install_success">插件“%1$s”已安装，开启后即可使用</string>
++  <string name="plugin_page_install_failed">安装失败：%1$s</string>
++  <string name="plugin_page_enable_title">启用“%1$s”？</string>
++  <string name="plugin_page_enable_warning">插件在应用内运行，可完全访问应用数据（包括聊天记录和 API 密钥），没有沙箱隔离。请仅启用可信来源的插件。</string>
++  <string name="plugin_page_enable">启用</string>
++  <string name="plugin_page_delete_title">删除“%1$s”？</string>
++  <string name="plugin_page_delete_text">插件及其文件将被删除。</string>
++  <string name="plugin_page_error">错误：%1$s</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 3342480..9dd976d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1931,4 +1931,18 @@
+   <string name="quick_start_card_desc">RikkaHub needs a model provider to chat. Follow the quick start to set up a provider and default model, or migrate your chat history from DeepSeek.</string>
+   <string name="setting_page_quick_start">Quick Start</string>
+   <string name="setting_page_quick_start_desc">Set up providers and models step by step, or migrate from DeepSeek</string>
++  <string name="setting_page_plugins">Plugins</string>
++  <string name="setting_page_plugins_desc">Install and manage plugins (.zip) that extend the app</string>
++  <string name="setting_page_plugins_add">Add plugins</string>
++  <string name="plugin_page_add">Add plugin</string>
++  <string name="plugin_page_empty">No plugins installed</string>
++  <string name="plugin_page_empty_hint">Tap + and choose a plugin .zip file</string>
++  <string name="plugin_page_install_success">Plugin \"%1$s\" installed. Turn it on to start using it</string>
++  <string name="plugin_page_install_failed">Install failed: %1$s</string>
++  <string name="plugin_page_enable_title">Enable \"%1$s\"?</string>
++  <string name="plugin_page_enable_warning">A plugin runs inside the app with full access to its data, including chats and API keys, and is not sandboxed. Only enable plugins from sources you trust.</string>
++  <string name="plugin_page_enable">Enable</string>
++  <string name="plugin_page_delete_title">Delete \"%1$s\"?</string>
++  <string name="plugin_page_delete_text">The plugin and its files will be removed.</string>
++  <string name="plugin_page_error">Error: %1$s</string>
+ </resources>
+diff --git a/plugin-sdk/README.md b/plugin-sdk/README.md
+new file mode 100644
+index 0000000..f6e2cfa
+--- /dev/null
++++ b/plugin-sdk/README.md
+@@ -0,0 +1,45 @@
++# Плагины RikkaHub
++
++Плагин — это `.zip` с кодом на **Java или Kotlin**, скомпилированным в DEX:
++
++```
++plugin.zip
++├── plugin.json      # манифест
++├── classes.dex      # (и classes2.dex, ...) код плагина
++├── lib/arm64-v8a/*.so   # необязательно: нативные библиотеки
++└── любые файлы...   # ресурсы, доступны в <pluginDir>/files/
++```
++
++## plugin.json
++
++| поле | описание |
++|---|---|
++| `id` | уникальный id: латиница, цифры, `_`, `-` (до 32 символов) |
++| `name`, `version`, `author`, `description` | отображаются в списке плагинов |
++| `mainClass` | полное имя класса, унаследованного от `RikkaPlugin` (публичный конструктор без аргументов) |
++| `minAppVersionCode` | минимальная версия приложения (необязательно) |
++
++## Что может плагин (`RikkaPlugin`)
++
++- `getTools()` — свои инструменты для модели (JSON-схема параметров, обработчик возвращает текст);
++- `getSystemPrompt()` — дополнение к системному промпту;
++- `transformInput(role, text)` — изменить текст запроса перед отправкой модели;
++- `transformOutput(text)` — изменить ответ модели;
++- `onLoad(PluginContext)` / `onUnload()` — жизненный цикл. В `PluginContext` есть `Application`
++  (любые Android API, `ActivityLifecycleCallbacks` и т.п.), `getHostService(className)` — внутренние
++  сервисы приложения из Koin (SettingsStore, ChatService, ...), SharedPreferences и папка плагина.
++
++Плагин загружается в процесс приложения **без песочницы** и имеет те же права, что и приложение.
++Классы приложения доступны ему напрямую (через ClassLoader/рефлексию), поэтому плагин может менять поведение
++приложения очень глубоко. Включайте только доверенные плагины.
++
++## Сборка
++
++```
++ANDROID_HOME=~/Android/Sdk ./plugin-sdk/build-plugin.sh plugin-sdk/example-plugin
++```
++Получится `example-plugin/plugin.zip` — установите его в приложении: Настройки → Плагины → «+».
++
++Для Kotlin: скомпилируйте код kotlinc/Gradle с `RikkaPlugin` в classpath (исходники API —
++`app/src/main/java/me/rerere/rikkahub/plugin/api`), затем `d8` с `--classpath` на классы API (как в скрипте),
++не включая сами классы API в DEX. Библиотеку kotlin-stdlib в DEX включать не нужно — она есть в приложении.
+diff --git a/plugin-sdk/build-plugin.sh b/plugin-sdk/build-plugin.sh
+new file mode 100755
+index 0000000..10c1e30
+--- /dev/null
++++ b/plugin-sdk/build-plugin.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# Сборка плагина в .zip для RikkaHub.
++# Использование: ANDROID_HOME=~/Android/Sdk ./build-plugin.sh example-plugin
++# Требуется: JDK 17+, Android SDK (platforms/android-XX/android.jar и build-tools с d8), zip.
++set -euo pipefail
++PLUGIN_DIR="${1:?usage: build-plugin.sh <plugin-dir>}"
++: "${ANDROID_HOME:?set ANDROID_HOME to your Android SDK}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++API_SRC="$HERE/../app/src/main/java/me/rerere/rikkahub/plugin/api"
++ANDROID_JAR="$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
++D8="$(ls -d "$ANDROID_HOME"/build-tools/*/d8 | sort -V | tail -1)"
++OUT="$PLUGIN_DIR/build"
++rm -rf "$OUT" && mkdir -p "$OUT/api" "$OUT/classes" "$OUT/dex"
++
++# 1. API приложения (нужен только для компиляции, в zip не попадает)
++javac --release 8 -cp "$ANDROID_JAR" -d "$OUT/api" "$API_SRC"/*.java
++# 2. Код плагина
++javac --release 8 -cp "$ANDROID_JAR:$OUT/api" -d "$OUT/classes" $(find "$PLUGIN_DIR/src" -name '*.java')
++(cd "$OUT/classes" && jar cf ../classes.jar .)
++# 3. В DEX (классы API берутся из приложения во время работы)
++"$D8" --release --lib "$ANDROID_JAR" --classpath "$OUT/api" --output "$OUT/dex" "$OUT/classes.jar"
++# 4. Упаковка
++rm -f "$PLUGIN_DIR/plugin.zip"
++cp "$PLUGIN_DIR/plugin.json" "$OUT/dex/"
++[ -d "$PLUGIN_DIR/assets" ] && cp -r "$PLUGIN_DIR/assets/." "$OUT/dex/"
++(cd "$OUT/dex" && zip -r "$(cd "$PLUGIN_DIR" && pwd)/plugin.zip" .)
++echo "Готово: $PLUGIN_DIR/plugin.zip"
+diff --git a/plugin-sdk/example-plugin/plugin.json b/plugin-sdk/example-plugin/plugin.json
+new file mode 100644
+index 0000000..37d9134
+--- /dev/null
++++ b/plugin-sdk/example-plugin/plugin.json
+@@ -0,0 +1,9 @@
++{
++  "id": "hello",
++  "name": "Hello Plugin",
++  "version": "1.0",
++  "author": "You",
++  "description": "Example plugin: adds random_number and battery_level tools.",
++  "mainClass": "com.example.hello.HelloPlugin",
++  "minAppVersionCode": 197
++}
+diff --git a/plugin-sdk/example-plugin/src/com/example/hello/HelloPlugin.java b/plugin-sdk/example-plugin/src/com/example/hello/HelloPlugin.java
+new file mode 100644
+index 0000000..039366f
+--- /dev/null
++++ b/plugin-sdk/example-plugin/src/com/example/hello/HelloPlugin.java
+@@ -0,0 +1,57 @@
++package com.example.hello;
++
++import android.content.Context;
++import android.os.BatteryManager;
++
++import org.json.JSONObject;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.Random;
++
++import me.rerere.rikkahub.plugin.api.PluginContext;
++import me.rerere.rikkahub.plugin.api.PluginTool;
++import me.rerere.rikkahub.plugin.api.RikkaPlugin;
++
++/** Пример плагина: два инструмента для модели + дополнение к системному промпту. */
++public class HelloPlugin extends RikkaPlugin {
++    private PluginContext ctx;
++
++    @Override
++    public void onLoad(PluginContext context) {
++        this.ctx = context;
++        context.log("Hello plugin loaded, host version " + context.getHostVersionCode());
++    }
++
++    @Override
++    public List<PluginTool> getTools() {
++        PluginTool random = new PluginTool(
++                "random_number",
++                "Returns a random integer between min and max (inclusive).",
++                "{\"properties\":{\"min\":{\"type\":\"integer\"},\"max\":{\"type\":\"integer\"}},"
++                        + "\"required\":[\"min\",\"max\"]}",
++                args -> {
++                    JSONObject o = new JSONObject(args);
++                    int min = o.getInt("min");
++                    int max = o.getInt("max");
++                    return String.valueOf(min + new Random().nextInt(max - min + 1));
++                });
++
++        PluginTool battery = new PluginTool(
++                "battery_level",
++                "Returns the current battery level of the device in percent.",
++                null,
++                args -> {
++                    BatteryManager bm = (BatteryManager) ctx.getApplication()
++                            .getSystemService(Context.BATTERY_SERVICE);
++                    return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) + "%";
++                });
++
++        return Arrays.asList(random, battery);
++    }
++
++    @Override
++    public String getSystemPrompt() {
++        return "You can use the random_number and battery_level tools when the user asks for them.";
++    }
++}
