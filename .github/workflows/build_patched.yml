@@ -13,6 +13,39 @@ jobs:
           distribution: 'temurin'
       - name: Apply patch
         run: git apply rikkahub-plugins*.patch
+      - name: Create dummy google-services.json
+        run: |
+          cat << 'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "123456789000",
+              "project_id": "dummy-project",
+              "storage_bucket": "://appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789000:android:0000000000000000",
+                  "android_client_info": {
+                    "package_name": "me.rerere.rikkahub"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDummyKeyForBuild000000000000000"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
       - name: Build APK
         run: |
           chmod +x gradlew
@@ -22,3 +55,4 @@ jobs:
         with:
           name: rikkahub-patched-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          
